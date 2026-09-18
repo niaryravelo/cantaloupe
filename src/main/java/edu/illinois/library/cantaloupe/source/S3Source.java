@@ -10,8 +10,13 @@ import edu.illinois.library.cantaloupe.delegate.DelegateMethod;
 import edu.illinois.library.cantaloupe.util.S3ClientBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.exception.SdkClientException;
 import software.amazon.awssdk.core.exception.SdkException;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.s3.S3AsyncClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
@@ -34,6 +39,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * <p>Maps an identifier to an <a href="https://aws.amazon.com/s3/">Amazon
@@ -200,6 +206,12 @@ final class S3Source extends AbstractSource implements Source {
      * #getClientInstance(S3ObjectInfo)}.
      */
     private static final Map<String,S3Client> CLIENTS = new HashMap<>();
+    
+    /**
+     * Thread-safe map of asynchronous S3 clients, keyed by endpoint URI.    
+     */
+    private static final Map<String, S3AsyncClient> ASYNC_CLIENTS =
+            new ConcurrentHashMap<>();
 
     /**
      * Cached by {@link #getObjectInfo()}.
@@ -254,6 +266,55 @@ final class S3Source extends AbstractSource implements Source {
         }
         return client;
     }
+    
+    
+    static S3AsyncClient getAsyncClientInstance(S3ObjectInfo info) {
+        final Configuration config = Configuration.getInstance();
+
+        String endpoint = info.getEndpoint();
+        if (endpoint == null) {
+            endpoint = config.getString(Key.S3SOURCE_ENDPOINT);
+        }
+
+        final String finalEndpoint = endpoint;
+        return ASYNC_CLIENTS.computeIfAbsent(finalEndpoint, ep -> {
+            URI endpointURI = null;
+            if (ep != null) {
+                try {
+                    endpointURI = new URI(ep);
+                } catch (URISyntaxException e) {
+                    LOGGER.error("Invalid URI for {}: {}",
+                            Key.S3SOURCE_ENDPOINT, e.getMessage());
+                }
+            }
+
+            String region = info.getRegion();
+            if (region == null) {
+                region = config.getString(Key.S3SOURCE_REGION);
+            }
+            String accessKeyID = info.getAccessKeyID();
+            if (accessKeyID == null) {
+                accessKeyID = config.getString(Key.S3SOURCE_ACCESS_KEY_ID);
+            }
+            String secretAccessKey = info.getSecretAccessKey();
+            if (secretAccessKey == null) {
+                secretAccessKey = config.getString(Key.S3SOURCE_SECRET_KEY);
+            }
+            boolean forcePathStyle = config.getBoolean(
+                    Key.S3SOURCE_PARALLEL_FORCE_PATH_STYLE, false);
+
+            AwsBasicCredentials credentials = AwsBasicCredentials.create(
+                    accessKeyID, secretAccessKey);
+
+            return S3AsyncClient.builder()
+                    .region(Region.of(region))
+                    .credentialsProvider(StaticCredentialsProvider.create(credentials))
+                    .endpointOverride(endpointURI)
+                    .forcePathStyle(forcePathStyle)
+                    .build();
+        });
+    }
+    
 
     /**
      * Fetches a whole object.
@@ -423,11 +484,20 @@ final class S3Source extends AbstractSource implements Source {
 
     @Override
     public StreamFactory newStreamFactory() throws IOException {
-        return new S3StreamFactory(() -> {
+        final Configuration config = Configuration.getInstance();
+        
+        S3ObjectInfoSupplier infoSupplier = () -> {
             S3ObjectInfo info = getObjectInfo();
             info.setLength(getObjectAttributes().length);
             return info;
-        });
+        };
+        
+        if (config.getBoolean(Key.S3SOURCE_PARALLEL_ENABLED, false)) {
+			return new S3ParallelStreamFactory(infoSupplier);
+        }       
+        else {
+        	return new S3StreamFactory(infoSupplier);
+        }
     }
 
     @Override
