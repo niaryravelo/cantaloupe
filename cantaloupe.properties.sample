@@ -262,6 +262,54 @@ S3Source.chunking.cache.enabled = true
 # Max per-request chunk cache size.
 S3Source.chunking.cache.max_size = 5M
 
+#S3 parallel download optimisation
+# Globally enables or disables parallel downloading for S3 objects.
+# When set to true, large files are split into byte ranges and downloaded using multiple threads.
+S3Source.parallel.enabled=true
+
+# The absolute local directory path used to temporarily store file parts
+# during parallel downloading before they are merged and exposed as an InputStream.
+# Default user temp directory
+#S3Source.parallel.temp_path=
+
+# Forces the S3 client to use Path-Style addressing during parallel download (e.g., http://amazonaws.com)
+# instead of Virtual-Hosted addressing (e.g., http://amazonaws.com).
+# Typically required for S3-compatible alternatives like MinIO or LocalStack.
+S3Source.parallel.force_path_style=true
+
+# The number of concurrent threads allocated to the ThreadPoolExecutor
+# for handling parallel HTTP byte-range requests.
+# Default 70
+# Need restart to take effect
+S3Source.parallel.download.pool_size=70
+
+# The minimum file size (in Megabytes) required to trigger the parallel download mechanism.
+# Files smaller than this threshold will automatically fallback to the standard
+# Default 8MB 
+S3Source.parallel.file.min_size_mb=8
+
+# Target size (in Megabytes) of each byte-range part when downloading an S3
+# object in parallel. The number of parts is computed by dividing the object
+# size by this value, then clamped between S3Source.parallel.min_parts and
+# S3Source.parallel.max_parts.
+#
+# Lower values increase parallelism (more, smaller parts) and can improve
+# throughput on high-latency links, but also increase the number of requests
+# and per-request overhead. Higher values reduce the number of requests, which
+# is preferable for slow or throttled S3 endpoints.
+# Default 30
+S3Source.parallel.target_part_size_mb=30
+
+# Maximum number of parts used when downloading an S3 object in parallel.
+# Caps the number of concurrent byte-range requests so that very large objects
+# do not spawn an excessive number of tasks.
+#
+# Should generally be kept less than or equal to
+# S3Source.parallel.download.pool.size; otherwise excess tasks will wait in
+# the pool queue instead of running, negating the benefit of parallelism.
+# Default 16
+S3Source.parallel.max_parts=16
+
 #----------------------------------------
 # AzureStorageSource
 #----------------------------------------

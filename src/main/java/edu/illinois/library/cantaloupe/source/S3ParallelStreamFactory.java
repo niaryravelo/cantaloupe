@@ -5,9 +5,12 @@ import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -15,15 +18,15 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import edu.illinois.library.cantaloupe.config.Configuration;
 import edu.illinois.library.cantaloupe.config.Key;
-import software.amazon.awssdk.core.ResponseBytes;
-import software.amazon.awssdk.core.async.AsyncResponseTransformer;
-import software.amazon.awssdk.services.s3.S3AsyncClient;
+import software.amazon.awssdk.core.ResponseInputStream;
+import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
@@ -34,9 +37,11 @@ import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
  * a temporary file, then exposes that file as an InputStream. The behavior is
  * controlled by the following configuration: <br>
  * S3Source.parallel.enabled<br>
- * S3Source.parallel.download.pool.size (default 70)<br>
- * S3Source.parallel.file.min.size.mb (default 8MB)
+ * S3Source.parallel.download.pool_size (default 70)<br>
+ * S3Source.parallel.file.min_size_mb (default 8)<br>
  * S3Source.parallel.temp_path<br>
+ * S3Source.parallel.target_part_size_mb (default 30)<br>
+ * S3Source.parallel.max_parts (default 16)<br>
  * 
  * If file contentLength is lower than S3Source.parallel.file.min.size.mb it will use the existing S3StreamFactory class.
  * 
@@ -53,7 +58,7 @@ public class S3ParallelStreamFactory implements StreamFactory {
 	private static final Logger LOGGER = LoggerFactory.getLogger(S3ParallelStreamFactory.class);
 
 	private S3ObjectInfoSupplier objectInfo;
-	private final S3AsyncClient s3Client;
+	private final S3Client s3Client;
 	private Path tempFile;
 	private long contentLength;
 
@@ -62,14 +67,14 @@ public class S3ParallelStreamFactory implements StreamFactory {
 
 	public S3ParallelStreamFactory(S3ObjectInfoSupplier infoSupplier) throws IOException {
 		this.objectInfo = infoSupplier;
-		this.s3Client = S3Source.getAsyncClientInstance(infoSupplier.get());
+		this.s3Client = S3Source.getClientInstance(infoSupplier.get());
 	}
 
 	private long fetchContentLength() throws IOException {
 		try {
 			S3ObjectInfo s3ObjectInfo = objectInfo.get();
 			HeadObjectResponse r = s3Client.headObject(HeadObjectRequest.builder().bucket(s3ObjectInfo.getBucketName())
-					.key(objectInfo.get().getKey()).build()).join();
+					.key(objectInfo.get().getKey()).build());
 			return r.contentLength();
 
 		} catch (Exception e) {
@@ -85,7 +90,7 @@ public class S3ParallelStreamFactory implements StreamFactory {
 				Paths.get(System.getProperty("java.io.tmpdir")).toString());
 		Path tempDir = Paths.get(tempPathStr);
 		this.contentLength = fetchContentLength();
-		//No parallel for file under minFileSizeMB
+		// No parallel for file under minFileSizeMB.
 		int minFileSizeMB = configuration.getInt(Key.S3SOURCE_PARALLEL_MIN_FILE_SIZE_MB, DEFAULT_FILE_MIN_SIZE_MB);
 		if (this.contentLength < minFileSizeMB * 1024 * 1024) {
 			S3StreamFactory factory = new S3StreamFactory(objectInfo);
@@ -115,55 +120,101 @@ public class S3ParallelStreamFactory implements StreamFactory {
 	}
 
 	private void downloadInParallel(int minFileSizeMB) throws Exception {
-		int numParts = calculateOptimalParts(contentLength, minFileSizeMB);
+	    int numParts = calculateOptimalParts(contentLength, minFileSizeMB);
+	    long partSize = contentLength / numParts;
 
-		long partSize = contentLength / numParts;
+	    final int finalNumParts = numParts;
+	    final long finalPartSize = partSize;
 
-		LOGGER.debug("Downloading {} MB in {} parts ({} MB each)", contentLength / (1024.0 * 1024.0), numParts,
-				partSize / (1024.0 * 1024.0));
+	    LOGGER.debug("Downloading {} MB in {} parts ({} MB each)",
+	            contentLength / (1024.0 * 1024.0),
+	            finalNumParts,
+	            finalPartSize / (1024.0 * 1024.0));
 
-		try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
-			raf.setLength(contentLength);
-		}
+	    //Pré-allouer le fichier
+	    try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
+	        raf.setLength(contentLength);
+	    }
 
-		List<CompletableFuture<Void>> futures = new ArrayList<>(numParts);
-		AtomicLong total = new AtomicLong(0);
+	    S3ObjectInfo s3ObjectInfo = objectInfo.get();
+	    String bucket = s3ObjectInfo.getBucketName();
+	    String key = s3ObjectInfo.getKey();
 
-		S3ObjectInfo s3ObjectInfo = objectInfo.get();
-		String bucket = s3ObjectInfo.getBucketName();
-		String key = s3ObjectInfo.getKey();
+	    List<CompletableFuture<Void>> futures = new ArrayList<>(finalNumParts);
+	    AtomicLong total = new AtomicLong(0);
+	    AtomicReference<Throwable> firstError = new AtomicReference<>();
 
-		for (int i = 0; i < numParts; i++) {
-			final long startByte = (long) i * partSize;
-			final long endByte = (i == numParts - 1) ? contentLength - 1 : (long) (i + 1) * partSize - 1;
+	    // FileChannel partagé : write(ByteBuffer, position) est thread-safe (positional write),
+	    //    pas besoin de seek + synchronized, pas de RandomAccessFile par thread
+	    try (FileChannel channel = FileChannel.open(tempFile.toFile().toPath(),
+	            StandardOpenOption.WRITE, StandardOpenOption.CREATE)) {
 
-			futures.add(CompletableFuture.runAsync(() -> {
-				try {
-					GetObjectRequest req = GetObjectRequest.builder().bucket(bucket).key(key)
-							.range("bytes=" + startByte + "-" + endByte).build();
+	        for (int i = 0; i < finalNumParts; i++) {
+	            final long startByte = (long) i * finalPartSize;
+	            final long endByte = (i == finalNumParts - 1)
+	                    ? contentLength - 1
+	                    : Math.min((long) (i + 1) * finalPartSize - 1, contentLength - 1);
 
-					ResponseBytes<GetObjectResponse> bytes = s3Client.getObject(req, AsyncResponseTransformer.toBytes())
-							.join();
+	            if (startByte >= contentLength) {
+	                break;
+	            }
 
-					try (RandomAccessFile raf = new RandomAccessFile(tempFile.toFile(), "rw")) {
-						raf.seek(startByte);
-						raf.write(bytes.asByteArray());
-					}
-					total.addAndGet(bytes.asByteArray().length);
-				} catch (Exception e) {
-					throw new RuntimeException("Part failed: " + e.getMessage(), e);
-				}
-			}, S3DownloadPool.get()));
-		}
+	            futures.add(CompletableFuture.runAsync(() -> {
+	                // Si une autre part a déjà échoué, on abandonne
+	                if (firstError.get() != null) {
+	                    return;
+	                }
+	                try {
+	                    GetObjectRequest req = GetObjectRequest.builder()
+	                            .bucket(bucket)
+	                            .key(key)
+	                            .range("bytes=" + startByte + "-" + endByte)
+	                            .build();
 
-		CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-		ThreadPoolExecutor executor = S3DownloadPool.get();
-		int active = executor.getActiveCount();
-		int exPoolSize = executor.getPoolSize();
-		int queueSize = executor.getQueue().size();
-		LOGGER.debug("POOL: active={}, pool={}, queue={}", active, exPoolSize,
-				queueSize);
+	                    // Streaming direct dans le fichier — AUCUN buffer complet en mémoire.
+	                    //    ResponseInputStream lit par blocs, on écrit au bon offset via channel.write(buf, pos).
+	                    try (ResponseInputStream<GetObjectResponse> in = s3Client.getObject(req)) {
+	                        byte[] buffer = new byte[64 * 1024]; // 64 KB
+	                        long position = startByte;
+	                        int read;
+	                        while ((read = in.read(buffer)) != -1) {
+	                            ByteBuffer bb = ByteBuffer.wrap(buffer, 0, read);
+	                            while (bb.hasRemaining()) {
+	                                position += channel.write(bb, position);
+	                            }
+	                            total.addAndGet(read);
+	                        }
+	                    }
+	                } catch (Exception e) {
+	                    firstError.compareAndSet(null, e);
+	                    throw new RuntimeException("Part failed [" + startByte + "-" + endByte + "]: "
+	                            + e.getMessage(), e);
+	                }
+	            }, S3DownloadPool.get()));
+	        }
 
+	        try {
+	            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+	        } catch (Exception e) {
+	            // 5. Annuler les parts restantes en cas d'échec
+	            futures.forEach(f -> f.cancel(true));
+	            // Supprimer le fichier temporaire corrompu
+	            try {
+	                Files.deleteIfExists(tempFile);
+	            } catch (IOException ioEx) {
+	                LOGGER.warn("Failed to delete temp file after error: {}", tempFile, ioEx);
+	            }
+	            throw e;
+	        }
+	    }
+
+	    ThreadPoolExecutor executor = S3DownloadPool.get();
+	    LOGGER.debug("POOL: active={}, pool={}, queue={}",
+	            executor.getActiveCount(),
+	            executor.getPoolSize(),
+	            executor.getQueue().size());
+
+	    LOGGER.debug("Download complete: {} bytes", total.get());
 	}
 
 	private void cleanup() {
@@ -173,37 +224,39 @@ public class S3ParallelStreamFactory implements StreamFactory {
 			LOGGER.warn("Failed to delete {}", tempFile, e);
 		}
 	}
+	
+	/**
+	 * Calculates the optimal number of parts based on file size and
+	 * configuration.
+	 *
+	 * <p>Principle: we target a part size ({@code target_part_size_mb}) instead of
+	 * using hard-coded tiers. The result is bounded by 2 and
+	 * {@code max_parts}.
+	 *
+	 * <p>Configuration keys:<br>
+	 * S3Source.parallel.target_part_size_mb (default 30)<br>
+	 * S3Source.parallel.max_parts (default 16)</p>
+	 */
+	private static int calculateOptimalParts(long fileSizeBytes, int minFileSizeMB) {
 
-	public static int calculateOptimalParts(long fileSizeBytes, int minFileSizeMB) {
-		
-		//No parallel for file under minFileSizeMB 
-		if (fileSizeBytes < minFileSizeMB * 1024 * 1024) { 
-	        return 1; 
+	    // No parallelism below the minimum threshold.
+	    if (fileSizeBytes < (long) minFileSizeMB * 1024 * 1024) {
+	        return 1;
 	    }
-		
-		final double sizeMB = fileSizeBytes / (1024.0 * 1024.0);
 
-		if (sizeMB < 50) {
-			return sizeMB < 25 ? 2 : 3;
-		}
+	    final Configuration conf = Configuration.getInstance();
 
-		if (sizeMB < 200) {
-			// ~21 MB par part
-			return clamp((int) Math.round(sizeMB / 21.0), 5, 8);
-		}
+	    final int targetPartSizeMB = Math.max(1,
+	            conf.getInt(Key.S3SOURCE_PARALLEL_TARGET_PART_SIZE_MB, 30));
+	    final int minParts = 2;
+	    final int maxParts = Math.max(minParts,
+	            conf.getInt(Key.S3SOURCE_PARALLEL_MAX_PARTS, 16));
 
-		if (sizeMB < 500) {
-			// ~30 MB par part
-			return clamp((int) Math.round(sizeMB / 30.0), 8, 12);
-		}
+	    final double sizeMB = fileSizeBytes / (1024.0 * 1024.0);
 
-		if (sizeMB < 1024) {
-			// ~35 MB par part
-			return clamp((int) Math.round(sizeMB / 35.0), 12, 16);
-		}
+	    int parts = (int) Math.round(sizeMB / (double) targetPartSizeMB);
 
-		// > 1 GB : ~55 MB par part
-		return Math.max(16, (int) Math.round(sizeMB / 55.0));
+	    return clamp(parts, minParts, maxParts);
 	}
 
 	private static int clamp(int value, int min, int max) {
